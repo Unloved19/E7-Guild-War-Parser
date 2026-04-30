@@ -1,0 +1,19 @@
+# Ignore API Packets folder
+API Packets/
+e7_keys.log
+
+# Ignore ALL files inside War Records (including subfolders)
+War Records/**/*
+# But keep the folder itself by allowing this specific file
+!War Records/.gitkeep
+
+# Ignore ALL files inside War Screenshots (including subfolders)
+War Screenshots/**/*
+# But keep the folder itself by allowing this specific file
+!War Screenshots/.gitkeep
+
+#Ignore Json
+*.json
+
+#Ignore Spreadsheets
+*.xlsx
