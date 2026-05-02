@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import subprocess
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -27,12 +28,10 @@ try:
 except ImportError as exc:
     raise SystemExit("Missing dependency: easyocr. Install with: python -m pip install easyocr") from exc
 
-try:
-    from openpyxl import load_workbook
-    from openpyxl.styles import Font, PatternFill
-    from openpyxl.utils.datetime import from_excel
-except ImportError as exc:
-    raise SystemExit("Missing dependency: openpyxl. Install with: python -m pip install openpyxl") from exc
+import gspread
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
 
 # ============================================================================
@@ -40,19 +39,19 @@ except ImportError as exc:
 # ============================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-WORKBOOK_PATH = BASE_DIR / "Zodiac GW Spreadsheet.xlsx"
 SCREENSHOTS_ROOT = BASE_DIR / "War Screenshots"
 ALIASES_PATH = BASE_DIR / "war_name_aliases.json"
 DEBUG_ROOT = BASE_DIR / "debug_gw_parser"
-
-
+CONFIG_PATH = BASE_DIR / "config.json"
+TOKEN_PATH = BASE_DIR / "token.json"
+SECRET_PATH = BASE_DIR / "client_secret.json"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 # ============================================================================
 # WORKBOOK CONFIGURATION
 # ============================================================================
-
-SOURCE_SHEET = "2026-1"
-TARGET_SHEET = "2026-1"
-PROCESSING_SHEET = "Processing"
 
 SECTION_HEADERS = [
     "Roster Active Status", "Tokens Tracking", "Offense Wins", "Offense Draws",
@@ -63,17 +62,6 @@ SECTION_HEADERS = [
 WRITE_SECTIONS = [
     "Roster Active Status", "Tokens Tracking", "Offense Wins", "Offense Draws",
     "Offense Losses", "Defense Wins", "Defense Draws", "Defense Losses",
-]
-
-HEADER_FILL = "1F4E78"
-SUBHEADER_FILL = "D9EAF7"
-
-RAW_NAME_HEADER = "Raw Name"
-MATCHED_NAME_HEADER = "Matched Workbook Name"
-
-PROCESSING_RESULTS_HEADER = [
-    "Screenshot", "Order", RAW_NAME_HEADER, MATCHED_NAME_HEADER,
-    "Off W", "Off D", "Off L", "Def W", "Def D", "Def L", "Result String",
 ]
 
 PROCESSING_NORMALIZED_HEADER = [
@@ -199,6 +187,56 @@ def load_aliases(path: Path) -> Dict[str, str]:
 def save_aliases(path: Path, aliases: Dict[str, str]) -> None:
     path.write_text(json.dumps(aliases, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing {CONFIG_PATH.name}. Create it with your spreadsheet ID, sheet names, and override column."
+        )
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def get_gspread_client() -> gspread.Client:
+    if not SECRET_PATH.exists():
+        raise SystemExit(f"Missing {SECRET_PATH.name}. Run setup_auth.py first.")
+    creds = None
+    if TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            raise SystemExit("Token expired or missing. Run setup_auth.py again.")
+    return gspread.authorize(creds)
+
+
+def col_letter_to_num(letter: str) -> int:
+    num = 0
+    for ch in letter.upper():
+        num = num * 26 + (ord(ch) - ord("A") + 1)
+    return num
+
+def _col_num_to_letter(col: int) -> str:
+    result = ""
+    while col > 0:
+        col, remainder = divmod(col - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def fetch_sheet_data(ws) -> List[List]:
+    """Fetches the entire sheet in a single API call. Returns a 2D list of strings."""
+    return ws.get_all_values()
+
+
+def cell_val(data: List[List], row: int, col: int) -> Optional[str]:
+    """Get cell value from fetched data. row and col are 1-indexed."""
+    if row < 1 or row > len(data):
+        return None
+    row_data = data[row - 1]
+    if col < 1 or col > len(row_data):
+        return None
+    val = row_data[col - 1]
+    return val if val != "" else None
 
 # ============================================================================
 # TEXT PROCESSING & NORMALIZATION
@@ -262,15 +300,6 @@ def sheet_date_to_folder_date_str(value) -> Optional[str]:
         return value.date().strftime("%Y%m%d")
     if isinstance(value, date):
         return value.strftime("%Y%m%d")
-    if isinstance(value, (int, float)):
-        try:
-            dt = from_excel(value)
-            if isinstance(dt, datetime):
-                return dt.date().strftime("%Y%m%d")
-            if isinstance(dt, date):
-                return dt.strftime("%Y%m%d")
-        except Exception:
-            return None
     if isinstance(value, str):
         value = value.strip()
         for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y", "%Y/%m/%d", "%Y%m%d"):
@@ -296,15 +325,18 @@ def ask_run_mode() -> str:
     print("\nRun Mode")
     print("1. Dry run")
     print("2. Write to workbook")
-    print("3. Cancel")
+    print("3. Configure (spreadsheet, sheet name, auth)")
+    print("4. Sync roster (add/remove players in helper sections)")
+    print("5. New season (duplicate tab, clear data, keep roster)")
+    print("6. Cancel")
     while True:
-        choice = input("Choose 1/2/3: ").strip()
-        if choice == "1":
-            return "dry"
-        if choice == "2":
-            return "write"
-        if choice == "3":
-            raise KeyboardInterrupt
+        choice = input("Choose 1/2/3/4/5/6: ").strip()
+        if choice == "1": return "dry"
+        if choice == "2": return "write"
+        if choice == "3": return "configure"
+        if choice == "4": return "sync"
+        if choice == "5": return "new-season"
+        if choice == "6": raise KeyboardInterrupt
         print("Invalid choice.")
 
 
@@ -352,13 +384,13 @@ def prompt_stat_line(label: str) -> Tuple[int, int, int]:
 # WORKSHEET READING OPERATIONS
 # ============================================================================
 
-def read_roster(ws) -> List[str]:
+def read_roster(data) -> List[str]:
     roster: List[str] = []
     blank_run = 0
     row = 5
-    while row <= ws.max_row:
-        value = ws[f"B{row}"].value
-        if value is None or str(value).strip() == "":
+    while row <= len(data) + 10:
+        value = cell_val(data, row, 2)
+        if value is None:
             blank_run += 1
             if blank_run >= 10:
                 break
@@ -373,44 +405,75 @@ def read_roster(ws) -> List[str]:
         row += 1
 
     if not roster:
+        raise RuntimeError("No roster found starting from B5.")
+    return roster
+
+    if not roster:
         raise RuntimeError(f"No roster found in {ws.title} starting from B5.")
     return roster
 
+    
+def read_column_a_overrides(data, roster: List[str], override_col: str) -> Dict[str, str]:
+    """Reads the override column to build match redirects for returning players.
+    
+    When the override column contains a bare player name (e.g. "Kyūbi焔"), it means:
+    "OCR text matching this name should map to the roster name in column B"
+    (e.g. "Kyūbi焔 (2) (Rejoined 02/5/26)"), overriding the default matcher.
+    """
+    overrides: Dict[str, str] = {}
+    row = 5
+    roster_idx = 0
+    override_col_num = col_letter_to_num(override_col)
 
-def find_date_row(ws, folder_name: str) -> int:
-    for row in range(5, ws.max_row + 1):
-        val = ws[f"N{row}"].value
+    while row <= len(data) + 10 and roster_idx < len(roster):
+        name = cell_val(data, row, 2)
+        override_val = cell_val(data, row, override_col_num)
+
+        if name and str(name).strip() in roster:
+            override = str(override_val).strip() if override_val else ""
+            if override:
+                overrides[canonical_key(override)] = str(name).strip()
+            roster_idx += 1
+
+        row += 1
+    return overrides
+
+def find_date_row(data, folder_name: str, date_col: int = 15) -> int:
+    for row in range(5, len(data) + 1):
+        val = cell_val(data, row, date_col)
         if sheet_date_to_folder_date_str(val) == folder_name:
             return row
-    raise RuntimeError(f"Could not find date {folder_name} in {ws.title} column N.")
+    raise RuntimeError(f"Could not find date {folder_name} in column {date_col}.")
 
 
-def find_section_starts(ws) -> Dict[str, int]:
+def find_section_starts(data) -> Dict[str, int]:
     starts: Dict[str, int] = {}
-    for col in range(1, ws.max_column + 1):
-        value = ws.cell(2, col).value
-        if value is None:
+    max_col = max((len(r) for r in data), default=0)
+    for col in range(1, max_col + 1):
+        value = cell_val(data, 2, col)
+        if not value:
             continue
         text = str(value).strip()
         if text in SECTION_HEADERS and text not in starts:
             starts[text] = col
     missing = [h for h in WRITE_SECTIONS if h not in starts]
     if missing:
-        raise RuntimeError(f"Missing section headers on {ws.title}: {missing}")
+        raise RuntimeError(f"Missing section headers: {missing}")
     return starts
 
 
-def build_target_section_maps(ws) -> Dict[str, Dict[str, int]]:
-    starts = find_section_starts(ws)
+def build_target_section_maps(data) -> Dict[str, Dict[str, int]]:
+    starts = find_section_starts(data)
     maps: Dict[str, Dict[str, int]] = {}
     sorted_headers = sorted(starts.items(), key=lambda item: item[1])
+    max_col = max((len(r) for r in data), default=0)
 
     for idx, (header, start_col) in enumerate(sorted_headers):
-        next_start = sorted_headers[idx + 1][1] if idx + 1 < len(sorted_headers) else ws.max_column + 1
+        next_start = sorted_headers[idx + 1][1] if idx + 1 < len(sorted_headers) else max_col + 1
         name_map: Dict[str, int] = {}
         for col in range(start_col + 1, next_start):
-            value = ws.cell(2, col).value
-            if value is None:
+            value = cell_val(data, 2, col)
+            if not value:
                 continue
             name = str(value).strip()
             if name in SECTION_HEADERS:
@@ -458,16 +521,16 @@ def crop_bounds(
 ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
     height, _ = img.shape[:2]
 
-    # Use name_center for the green box bounds
+    # Reverted top padding to original, extended bottom by 30px to catch UI scroll overshoot
     name_y1 = max(0, name_center_y - 26)
-    name_y2 = min(height, name_center_y + 63)  # Lowered by 30px (was 33)
+    name_y2 = min(height, name_center_y + 93)  # Extended bottom by 30px (was 63)
 
-    # Use stat_center for the blue/red box bounds
+    # Reverted top padding to original, extended bottom by 30px to catch UI scroll overshoot
     stats_y1 = max(0, stat_center_y - 33)
-    stats_y2 = min(height, stat_center_y + 155)  # Lowered by 70px (was 85)
+    stats_y2 = min(height, stat_center_y + 185)  # Extended bottom by 30px (was 155)
 
     if total_slots == 4 and row_slot == 4:
-        stats_y2 = min(height, stat_center_y + 168)  # Lowered by 70px (was 98)
+        stats_y2 = min(height, stat_center_y + 198)  # Extended bottom by 30px (was 168)
 
     if total_slots == 2:
         stats_y2 = min(height, stats_y2 + 10)
@@ -549,7 +612,27 @@ def best_name_token_from_line(text: str) -> str:
     filtered = [tok for tok in tokens if not looks_like_ui_noise(tok)]
     if not filtered:
         return ""
-    return max(filtered, key=name_token_score)
+    
+    # COMBINATION LOGIC: Fix names split by spaces (e.g., "Kyūbi 焰" -> "Kyūbi焰")
+    combined = []
+    for tok in filtered:
+        if combined:
+            prev = combined[-1]
+            # Check if previous token is primarily Latin/English
+            prev_is_latin = prev.isascii() and any(c.isalpha() for c in prev)
+            # Check if current token contains CJK (Japanese/Chinese) characters
+            curr_is_cjk = any(
+                "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" or "\uac00" <= ch <= "\ud7af"
+                for ch in tok
+            )
+            # If we have Latin followed by CJK, merge them together
+            if prev_is_latin and curr_is_cjk:
+                combined[-1] = prev + tok
+                continue
+                
+        combined.append(tok)
+
+    return max(combined, key=name_token_score)
 
 
 def extract_name_text(reader, image) -> str:
@@ -588,15 +671,22 @@ def try_direct_name_match(
     raw_name: str, roster: List[str], matcher: Dict[str, str], aliases: Dict[str, str]
 ) -> Optional[Tuple[str, str]]:
     raw_name = cleaned_text(raw_name)
+    key = canonical_key(raw_name)
+
+    # Matcher first (includes column A overrides)
+    if key in matcher:
+        matched = matcher[key]
+        note = "Matched to removed-tag name" if base_roster_name(matched) != matched else ""
+        if raw_name in aliases and aliases[raw_name] != matched:
+            note = "Column C override (superseded alias)"
+        return matched, note
+
+    # Alias fallback (only if matcher has no entry for this key)
     if raw_name in aliases and aliases[raw_name] in roster:
         matched = aliases[raw_name]
         note = "Matched to removed-tag name" if base_roster_name(matched) != matched else "Manual alias fix"
         return matched, note
-    key = canonical_key(raw_name)
-    if key in matcher:
-        matched = matcher[key]
-        note = "Matched to removed-tag name" if base_roster_name(matched) != matched else ""
-        return matched, note
+
     return None
 
 
@@ -752,11 +842,19 @@ def parse_defense_from_crop(reader, image) -> Tuple[int, int, int]:
 # NAME MATCHING & RESOLUTION
 # ============================================================================
 
-def build_roster_matcher(roster: List[str]) -> Dict[str, str]:
+def build_roster_matcher(
+    roster: List[str], overrides: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
     matcher: Dict[str, str] = {}
     for name in roster:
         matcher[canonical_key(name)] = name
         matcher[canonical_key(base_roster_name(name))] = name
+
+    # Overrides applied last so they take priority over normal entries
+    if overrides:
+        for key, name in overrides.items():
+            matcher[key] = name
+
     return matcher
 
 
@@ -893,6 +991,7 @@ def extract_rows_from_folder(
     aliases_existing: Dict[str, str],
     aliases_working: Dict[str, str],
     aliases_created_this_run: Dict[str, str],
+    overrides: Dict[str, str], 
 ) -> Tuple[List[OCRRow], Dict[Tuple[str, int], OCRContext]]:
     if not folder.exists():
         raise FileNotFoundError(f"Folder not found: {folder}")
@@ -902,7 +1001,7 @@ def extract_rows_from_folder(
     if not pngs:
         raise RuntimeError(f"No PNG files found in {folder}")
 
-    matcher = build_roster_matcher(roster)
+    matcher = build_roster_matcher(roster, overrides)  # <--- PASS OVERRIDES TO MATCHER BUILDER
     stats_reader = get_reader("stats")
     
     # Pre-load all OCR models into memory to avoid mid-run stuttering
@@ -935,7 +1034,6 @@ def extract_rows_from_folder(
             off_crop = safe_crop(img, OFF_CROP_X1, stats_y1, OFF_CROP_X2 - narrow_offset, stats_y2)
             def_crop = safe_crop(img, DEF_CROP_X1, stats_y1, DEF_CROP_X2 - narrow_offset, stats_y2)
             
-            # ... (rest of the loop remains exactly the same)
 
             name_candidates = parse_name_candidates_from_crop(name_crop, roster, matcher, aliases_working)
             if not name_candidates:
@@ -1091,94 +1189,12 @@ def cleanup_debug_images(root: Path = DEBUG_ROOT) -> None:
 # WORKSHEET WRITING OPERATIONS
 # ============================================================================
 
-def ensure_processing_sheet(wb):
-    if PROCESSING_SHEET in wb.sheetnames:
-        del wb[PROCESSING_SHEET]
-    return wb.create_sheet(PROCESSING_SHEET)
-
-
-def style_header_row(ws, row: int, start_col: int, end_col: int, fill: str = HEADER_FILL):
-    for col in range(start_col, end_col + 1):
-        cell = ws.cell(row, col)
-        cell.fill = PatternFill("solid", fgColor=fill)
-        cell.font = Font(bold=True, color="FFFFFF")
-
-
-def write_processing_sheet(
-    ws, folder_name: str, extracted: List[OCRRow],
-    normalized: List[Dict[str, object]], aliases_created_this_run: Dict[str, str],
-) -> None:
-    ws["A1"] = "Guild War Processing Output"
-    ws["A2"] = "Folder"
-    ws["B2"] = folder_name
-    ws["A3"] = "Workbook Output Sheet"
-    ws["B3"] = TARGET_SHEET
-    style_header_row(ws, 1, 1, 4)
-    style_header_row(ws, 2, 1, 2, SUBHEADER_FILL)
-    style_header_row(ws, 3, 1, 2, SUBHEADER_FILL)
-
-    start_row = 5
-    ws.cell(start_row, 1, "Results Output")
-    style_header_row(ws, start_row, 1, len(PROCESSING_RESULTS_HEADER))
-    for idx, header in enumerate(PROCESSING_RESULTS_HEADER, start=1):
-        ws.cell(start_row + 1, idx, header)
-    style_header_row(ws, start_row + 1, 1, len(PROCESSING_RESULTS_HEADER), SUBHEADER_FILL)
-
-    for i, row in enumerate(extracted, start=start_row + 2):
-        values = [
-            row.screenshot, row.order, row.raw_name, row.matched_name,
-            row.off_w, row.off_d, row.off_l, row.def_w, row.def_d, row.def_l, row.result_string,
-        ]
-        for j, value in enumerate(values, start=1):
-            ws.cell(i, j, value)
-
-    norm_start = start_row + 4 + len(extracted)
-    ws.cell(norm_start, 1, "Normalized Table")
-    style_header_row(ws, norm_start, 1, len(PROCESSING_NORMALIZED_HEADER))
-    for idx, header in enumerate(PROCESSING_NORMALIZED_HEADER, start=1):
-        ws.cell(norm_start + 1, idx, header)
-    style_header_row(ws, norm_start + 1, 1, len(PROCESSING_NORMALIZED_HEADER), SUBHEADER_FILL)
-    for i, row in enumerate(normalized, start=norm_start + 2):
-        for j, header in enumerate(PROCESSING_NORMALIZED_HEADER, start=1):
-            ws.cell(i, j, row[header])
-
-    preview_headers = [
-        "Name", "Active flag", "Tokens Used", "Offense W", "Offense D", "Offense L",
-        "Defense W", "Defense D", "Defense L",
-    ]
-    preview_start = norm_start + 4 + len(normalized)
-    ws.cell(preview_start, 1, "Write Preview")
-    style_header_row(ws, preview_start, 1, len(preview_headers))
-    for idx, header in enumerate(preview_headers, start=1):
-        ws.cell(preview_start + 1, idx, header)
-    style_header_row(ws, preview_start + 1, 1, len(preview_headers), SUBHEADER_FILL)
-    for i, row in enumerate(normalized, start=preview_start + 2):
-        for j, header in enumerate(preview_headers, start=1):
-            ws.cell(i, j, row[header])
-
-    alias_start = preview_start + 4 + len(normalized)
-    ws.cell(alias_start, 1, "New Aliases Created This Run")
-    style_header_row(ws, alias_start, 1, 2)
-    ws.cell(alias_start + 1, 1, "Raw OCR Name")
-    ws.cell(alias_start + 1, 2, "Workbook Name")
-    style_header_row(ws, alias_start + 1, 1, 2, SUBHEADER_FILL)
-    row_idx = alias_start + 2
-    for raw_name, workbook_name in sorted(aliases_created_this_run.items()):
-        ws.cell(row_idx, 1, raw_name)
-        ws.cell(row_idx, 2, workbook_name)
-        row_idx += 1
-
-    widths = {"A": 22, "B": 12, "C": 28, "D": 32, "E": 10, "F": 10, "G": 10, "H": 10, "I": 10, "J": 10, "K": 46}
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-
-
 def row_has_existing_values(
-    ws, target_row: int, section_maps: Dict[str, Dict[str, int]]
+    data, target_row: int, section_maps: Dict[str, Dict[str, int]]
 ) -> bool:
     for section_name in WRITE_SECTIONS:
         for col in section_maps[section_name].values():
-            if ws.cell(target_row, col).value not in (None, ""):
+            if cell_val(data, target_row, col) not in (None, ""):
                 return True
     return False
 
@@ -1186,15 +1202,22 @@ def row_has_existing_values(
 def clear_target_row_values(
     ws, target_row: int, section_maps: Dict[str, Dict[str, int]]
 ) -> None:
+    updates = []
     for section_name in WRITE_SECTIONS:
         for col in section_maps[section_name].values():
-            ws.cell(target_row, col).value = None
+            updates.append({
+                "range": f"{_col_num_to_letter(col)}{target_row}",
+                "values": [[""]]
+            })
+    if updates:
+        ws.batch_update(updates)
 
 
 def write_to_rough_sheet(
     ws, target_row: int, normalized: List[Dict[str, object]],
     section_maps: Dict[str, Dict[str, int]],
 ) -> None:
+    updates = []
     for row in normalized:
         name = row["Name"]
         mappings = {
@@ -1211,20 +1234,25 @@ def write_to_rough_sheet(
             col_map = section_maps[section_name]
             if name not in col_map:
                 continue
-            ws.cell(target_row, col_map[name], value)
+            updates.append({
+                "range": f"{_col_num_to_letter(col_map[name])}{target_row}",
+                "values": [[value]]
+            })
+    if updates:
+        ws.batch_update(updates)
 
 
 def get_previous_war_active_status(
-    ws, target_row: int, section_maps: Dict[str, Dict[str, int]]
+    data, target_row: int, section_maps: Dict[str, Dict[str, int]], date_col: int = 15
 ) -> Optional[Dict[str, bool]]:
     active_cols = section_maps.get("Roster Active Status", {})
     for row in range(target_row - 1, 4, -1):
-        if ws.cell(row, 14).value is None:
+        if not cell_val(data, row, date_col):
             continue
         prev_status = {}
         has_any_data = False
         for name, col in active_cols.items():
-            val = ws.cell(row, col).value
+            val = cell_val(data, row, col)
             if val is not None and val != "":
                 has_any_data = True
                 prev_status[name] = True
@@ -1358,12 +1386,32 @@ def live_capture_loop(temp_dir: Path, stop_event: threading.Event) -> int:
     return saved_count
 
 
-
 def main():
     # --- DEBUG CLEANUP PROMPT ---
     if DEBUG_ROOT.exists():
         if ask_yes_no("Debug images from previous runs found. Delete them before starting?", default=True):
             cleanup_debug_images()
+
+    # --- FIRST-RUN / CONFIGURE CHECK ---
+    if not CONFIG_PATH.exists():
+        print("No configuration found. Running setup wizard...\n")
+        subprocess.run([sys.executable, str(BASE_DIR / "first_run_setup.py")], check=True)
+        return
+
+    print("Guild War Screenshot Parser -> Workbook Writer")
+    run_mode = ask_run_mode()
+
+    if run_mode == "configure":
+        subprocess.run([sys.executable, str(BASE_DIR / "first_run_setup.py")], check=True)
+        return
+
+    if run_mode == "sync":
+        subprocess.run([sys.executable, str(BASE_DIR / "sync_roster.py")], check=True)
+        return
+
+    if run_mode == "new-season":
+        subprocess.run([sys.executable, str(BASE_DIR / "sync_roster.py"), "--new-season"], check=True)
+        return
 
     print("Guild War Screenshot Parser -> Workbook Writer")
     run_mode = ask_run_mode()
@@ -1417,36 +1465,28 @@ def main():
     if not screenshots_folder.exists():
         raise FileNotFoundError(f"Could not find source: {screenshots_folder}")
 
-    lock_file = BASE_DIR / f"~${WORKBOOK_PATH.name}"
-    if lock_file.exists():
-        print(f"\nError: The workbook is currently open in Excel.")
-        print(f"Detected lock file: {lock_file.name}")
-        print("Please save and close the workbook in Excel, then run this script again.")
-        raise SystemExit(1)
-
-    if not WORKBOOK_PATH.exists():
-        raise FileNotFoundError(f"Could not find workbook: {WORKBOOK_PATH}")
 
     aliases_existing = load_aliases(ALIASES_PATH)
     aliases_working = dict(aliases_existing)
     aliases_created_this_run: Dict[str, str] = {}
+    config = load_config()
+    client = get_gspread_client()
+    spreadsheet = client.open_by_key(config["spreadsheet_id"])
 
-    wb = load_workbook(WORKBOOK_PATH)
-    wb_values = load_workbook(WORKBOOK_PATH, data_only=True, read_only=True)
+    source_ws = spreadsheet.worksheet(config["source_sheet"])
+    target_ws = spreadsheet.worksheet(config["target_sheet"])
 
-    if SOURCE_SHEET not in wb.sheetnames:
-        raise RuntimeError(f"Sheet missing: {SOURCE_SHEET}")
-    if TARGET_SHEET not in wb.sheetnames:
-        raise RuntimeError(f"Sheet missing: {TARGET_SHEET}")
+    print("Fetching sheet data...", end=" ", flush=True)
+    source_data = fetch_sheet_data(source_ws)
+    target_data = fetch_sheet_data(target_ws)
+    print("Done.")
 
-    source_ws = wb[SOURCE_SHEET]
-    target_ws = wb[TARGET_SHEET]
-    target_ws_values = wb_values[TARGET_SHEET]
 
     # THESE MUST BE DEFINED OUTSIDE THE TRY BLOCK
-    roster = read_roster(source_ws)
-    target_row = find_date_row(target_ws_values, folder_name)
-    target_section_maps = build_target_section_maps(target_ws)
+    roster = read_roster(source_data)
+    target_row = find_date_row(target_data, folder_name, config["date_col"])
+    target_section_maps = build_target_section_maps(target_data)
+    overrides = read_column_a_overrides(target_data, roster, config["override_col"])
 
     # ==========================================
     # TRY BLOCK STARTS HERE
@@ -1454,25 +1494,24 @@ def main():
     try:
         extracted, _contexts = extract_rows_from_folder(
             screenshots_folder, folder_name, roster,
-            aliases_existing, aliases_working, aliases_created_this_run,
+            aliases_existing, aliases_working, aliases_created_this_run, overrides
         )
         normalized = build_normalized_table(roster, extracted)
 
         # --- CONTEXT-AWARE ACTIVE/INACTIVE RESOLUTION ---
-        prev_active_status = get_previous_war_active_status(target_ws_values, target_row, target_section_maps)
+        prev_active_status = get_previous_war_active_status(target_data, target_row, target_section_maps, config["date_col"])
 
         for row in normalized:
             display_name = base_roster_name(row["Name"])
 
             # SCENARIO 1: The "New Recruit Paradox" 
             if row["Active flag"] == 1 and prev_active_status is not None and not prev_active_status.get(row["Name"], False):
-                is_all_zero = (
-                    row["Offense W"] == 0 and row["Offense D"] == 0 and row["Offense L"] == 0 and
-                    row["Defense W"] == 0 and row["Defense D"] == 0 and row["Defense L"] == 0
-                )
-                if is_all_zero:
+                
+                # If they used 0 tokens, they didn't attack. Always ask to confirm participation,
+                # even if the defense column picked up a base defense stat or OCR noise.
+                if row["Tokens Used"] == 0:
                     if ask_yes_no(
-                        f"{display_name} is a new recruit with all 0s. Did they actually participate in this war?",
+                        f"{display_name} is a new recruit with 0 tokens used. Did they actually participate in this war?",
                         default=False,
                     ):
                         row["Notes"] = "Active (New recruit, confirmed 0 stats)"
@@ -1485,6 +1524,7 @@ def main():
                         })
                         extracted = [r for r in extracted if r.matched_name != row["Name"]]
                 else:
+                    # They used tokens, so they definitely participated
                     row["Notes"] = "Active (New recruit)"
                 continue
 
@@ -1530,9 +1570,6 @@ def main():
             if not ask_yes_no("Continue anyway?", default=False):
                 raise RuntimeError("Run cancelled because extracted player count was below threshold.")
 
-        # --- PROCESSING SHEET ---
-        proc_ws = ensure_processing_sheet(wb)
-        write_processing_sheet(proc_ws, folder_name, extracted, normalized, aliases_created_this_run)
 
         # --- DRY RUN CONVERSION LOGIC ---
         if run_mode == "dry":
@@ -1545,7 +1582,7 @@ def main():
 
         # --- WRITE TO WORKBOOK ---
         if run_mode == "write":
-            if row_has_existing_values(target_ws, target_row, target_section_maps):
+            if row_has_existing_values(target_data, target_row, target_section_maps):
                 if not ask_yes_no(
                     "Target row already has values in one or more write sections. Overwrite whole row?",
                     default=False,
@@ -1558,14 +1595,20 @@ def main():
             if aliases_created_this_run:
                 save_aliases(ALIASES_PATH, aliases_working)
                 
-            wb.save(WORKBOOK_PATH)
 
             print("\nDone.")
             print(f"Folder processed: {folder_name}")
-            print(f"Workbook updated: {WORKBOOK_PATH.name}")
-            print(f"Processing sheet rebuilt: {PROCESSING_SHEET}")
-            print(f"Data written to: {TARGET_SHEET} (date row matched from folder name)")
+            print(f"Data written to: {config['target_sheet']} (date row matched from folder name)")
             print(f"New aliases saved: {len(aliases_created_this_run)}")
+
+            # --- Export war record PNG ---
+            try:
+                subprocess.run(
+                    [sys.executable, str(BASE_DIR / "war_record_exporter.py"), folder_name],
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                print("Warning: War record export failed.")
 
     # ==========================================
     # FINALLY BLOCK ENSURES CLEANUP

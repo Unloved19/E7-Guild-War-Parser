@@ -12,8 +12,17 @@ War Screenshots/**/*
 # But keep the folder itself by allowing this specific file
 !War Screenshots/.gitkeep
 
-#Ignore Json
+# Ignore Json (user-specific config, tokens, secrets, aliases)
 *.json
 
-#Ignore Spreadsheets
+# Ignore Spreadsheets
 *.xlsx
+
+# Ignore old script
+zodiac_war_tools.py
+
+# Ignore debug output
+debug_gw_parser/
+
+# Ignore VS Code workspace settings
+.vscode/
