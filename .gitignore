@@ -89,5 +89,4 @@ desktop.ini
 # ============================================================================
 # DEVELOPMENT / DEBUG (Uncomment to ignore local test scripts)
 # ============================================================================
-# zodiac_war_tools.py
-# gw_parser_v0.6.py
+zodiac_war_tools.py
