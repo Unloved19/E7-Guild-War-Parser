@@ -1,28 +1,93 @@
-# Ignore API Packets folder
-API Packets/
-e7_keys.log
+# ============================================================================
+# RUNTIME & USER DATA (Generated after first run - DO NOT COMMIT)
+# ============================================================================
+config.json
+token.json
+war_name_aliases.json
+.easyocr/
 
-# Ignore ALL files inside War Records (including subfolders)
-War Records/**/*
-# But keep the folder itself by allowing this specific file
-!War Records/.gitkeep
-
-# Ignore ALL files inside War Screenshots (including subfolders)
-War Screenshots/**/*
-# But keep the folder itself by allowing this specific file
+# Keep empty folder structure in Git, but ignore user testing data inside them
+War Screenshots/*
 !War Screenshots/.gitkeep
+War Records/*
+!War Records/.gitkeep
+debug_gw_parser/*
+!debug_gw_parser/.gitkeep
 
-# Ignore Json (user-specific config, tokens, secrets, aliases)
-*.json
+# Temp files created during export
+__tmp_export_*.pdf
+~$*.xlsx
 
-# Ignore Spreadsheets
-*.xlsx
+# ============================================================================
+# SECRETS & LOCAL DEBUG (Do NOT commit personal keys/files)
+# ============================================================================
+e7_keys.log
+API Packets/
+Zodiac GW Spreadsheet.xlsx
+client_secret.json
 
-# Ignore old script
-zodiac_war_tools.py
+# NOTE: client_secret.json is INTENTIONALLY NOT ignored.
+# Since users are using your shared OAuth, it MUST be committed to the repo 
+# so it gets included in the GitHub Release ZIP file.
 
-# Ignore debug output
-debug_gw_parser/
+# ============================================================================
+# PYTHON
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Ignore VS Code workspace settings
+# ============================================================================
+# VIRTUAL ENVIRONMENTS
+# ============================================================================
+.venv/
+venv/
+ENV/
+env/
+gw_venv/
+
+# ============================================================================
+# BUILD ARTIFACTS (Generated locally - users download from GitHub Releases)
+# ============================================================================
+*.spec
+*.exe
+*.bat
+
+# ============================================================================
+# IDE & EDITORS
+# ============================================================================
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================================================
+# OPERATING SYSTEM FILES
+# ============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================================
+# DEVELOPMENT / DEBUG (Uncomment to ignore local test scripts)
+# ============================================================================
+# zodiac_war_tools.py
+# gw_parser_v0.6.py

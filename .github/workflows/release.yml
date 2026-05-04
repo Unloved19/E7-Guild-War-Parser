@@ -1,0 +1,53 @@
+name: Build and Release EXE
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers when you push a tag like "v1.0.0"
+
+permissions:
+  contents: write # Needed to create a GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest # Excel export requires Windows
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install PyInstaller
+      run: python -m pip install pyinstaller
+
+    - name: Build Launcher EXE
+      run: pyinstaller --onefile --name "GW Parser" --icon=icon.ico --console launcher.py
+
+    - name: Package Release Files
+      run: |
+        # Create a release directory
+        mkdir release
+        
+        # Copy the compiled EXE
+        Copy-Item "dist/GW Parser.exe" "release/"
+        
+        # Copy all necessary Python scripts
+        Copy-Item "*.py" "release/"
+        
+        # Copy OAuth credentials (Required since you share your OAuth)
+        Copy-Item "client_secret.json" "release/"
+        
+        # Zip the release folder
+        Compress-Archive -Path "release/*" -DestinationPath "GW_Parser_Windows.zip"
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: GW_Parser_Windows.zip
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

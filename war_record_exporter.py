@@ -7,8 +7,8 @@ Or called from the main parser after a successful write.
 """
 
 import sys
-import json
 import re
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -20,6 +20,7 @@ import gspread
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
+from openpyxl import load_workbook
 
 # ============================================================================
 # PATHS & CONFIG
@@ -100,6 +101,27 @@ def sheet_date_to_folder_date_str(value) -> Optional[str]:
                 continue
     return None
 
+def get_guild_name(config: dict, spreadsheet_title: str = None, workbook_path: Path = None) -> str:
+    """Get guild name from config, spreadsheet title, or workbook filename."""
+    # 1. Explicit config value
+    if config.get("guild_name"):
+        return config["guild_name"]
+    
+    # 2. Auto-detect from spreadsheet title (Google Sheets)
+    if spreadsheet_title:
+        return spreadsheet_title
+    
+    # 3. Auto-detect from workbook filename (Excel)
+    if workbook_path:
+        stem = workbook_path.stem  # e.g., "Zodiac GW Tracker"
+        # Remove common suffixes
+        for suffix in [" GW Tracker", " Tracker", " GW"]:
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+                break
+        return stem.strip() if stem.strip() else "Guild"
+    
+    return "Guild"
 
 # ============================================================================
 # IMAGE PROCESSING
@@ -149,6 +171,97 @@ def calculate_used_tokens(war_dates: List[str], current_date: str) -> int:
 # EXPORT LOGIC
 # ============================================================================
 
+def export_to_png_excel(
+    folder_name: str,
+    config: dict,
+    dpi: int = 300,
+) -> Path:
+    """Export Excel range to PDF via win32com, then convert to PNG with PyMuPDF."""
+    try:
+        import win32com.client as win32  # type: ignore
+    except ImportError:
+        raise SystemExit(
+            "win32com is not available.\n"
+            "This feature requires Windows with Microsoft Excel installed.\n"
+            "Use Google Sheets mode instead, or install Excel."
+        )
+
+    wb_path = BASE_DIR / config["excel"]["workbook_path"]
+    sheet_name = config["excel"]["sheet_name"]
+    date_col = config.get("date_col", 15)
+    export_range = "B2:S45"
+
+    # Get guild name from workbook filename
+    guild_name = get_guild_name(config, workbook_path=wb_path)
+
+    # Read data for token calculation
+    wb_read = load_workbook(wb_path, data_only=True, read_only=True)
+    ws_read = wb_read[sheet_name]
+    data = _excel_to_2d_list(ws_read, max_col=650)
+    wb_read.close()
+
+    war_dates = read_war_dates(data, date_col)
+    used = calculate_used_tokens(war_dates, folder_name)
+
+    print(f"Exporting {export_range} from {sheet_name} via Excel...", end=" ", flush=True)
+
+    # Export to temporary PDF via Excel's native PDF export
+    temp_pdf = BASE_DIR / f"__tmp_export_{folder_name}.pdf"
+
+    excel = win32.Dispatch("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    try:
+        wb = excel.Workbooks.Open(str(wb_path))
+        ws = wb.Sheets(sheet_name)
+        ws.Range(export_range).Select()
+
+        ws.ExportAsFixedFormat(
+            0,              # Type: xlTypePDF
+            str(temp_pdf),  # Filename: MUST be 2nd parameter
+            0,              # Quality: xlQualityStandard  
+            0,              # IncludeDocProperties
+            0,              # IgnorePrintAreas
+            0,              # From
+            0,              # To
+            0,              # OpenAfterPublish
+        )
+
+        wb.Close(False)
+    finally:
+        excel.Quit()
+
+    # Convert PDF to PNG using PyMuPDF
+    doc = fitz.open(str(temp_pdf))
+    page = doc.load_page(0)
+    scale = dpi / 72.0
+    matrix = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    img = trim_white_margins(img, padding=8)
+
+    WAR_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{guild_name} {used}-{SEASON_TOTAL_TOKENS} {folder_name}.png"
+    out_path = WAR_RECORDS_DIR / filename
+    img.save(str(out_path), "PNG")
+    print(f"Saved: {filename}")
+
+    # Cleanup temp PDF
+    if temp_pdf.exists():
+        temp_pdf.unlink()
+
+    return out_path
+
+
+def _excel_to_2d_list(ws, max_col: int = 650) -> list:
+    """Converts openpyxl worksheet to 2D list (same as sync_roster)."""
+    data = []
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=max_col, values_only=True):
+        data.append([str(v) if v is not None else "" for v in row])
+    return data
+
+
 def export_to_png(
     client: gspread.Client,
     spreadsheet_id: str,
@@ -156,8 +269,12 @@ def export_to_png(
     folder_name: str,
     dpi: int = 300,
 ) -> Path:
+    config = load_config()
     ws = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
     gid = ws.id
+
+    # Get guild name from spreadsheet title or config
+    guild_name = get_guild_name(config, spreadsheet_title=ws.spreadsheet.title)
 
     data = ws.get_all_values()
     war_dates = read_war_dates(data)
@@ -186,7 +303,7 @@ def export_to_png(
     img = trim_white_margins(img, padding=8)
 
     WAR_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"Zodiac {used}-{SEASON_TOTAL_TOKENS} {folder_name}.png"
+    filename = f"{guild_name} {used}-{SEASON_TOTAL_TOKENS} {folder_name}.png"
     out_path = WAR_RECORDS_DIR / filename
 
     img.save(str(out_path), "PNG")
@@ -208,11 +325,19 @@ def main():
         raise SystemExit("Date must be 8 digits in YYYYMMDD format.")
 
     config = load_config()
-    client = get_gspread_client()
+    backend_mode = config.get("mode", "google_sheet")
 
-    export_to_png(
-        client, config["spreadsheet_id"], config["target_sheet"], folder_name
-    )
+    if backend_mode == "excel":
+        export_to_png_excel(folder_name, config)
+    else:
+        gs_config = config.get("google_sheet", config)
+        client = get_gspread_client()
+        export_to_png(
+            client,
+            gs_config.get("spreadsheet_id", config.get("spreadsheet_id")),
+            gs_config.get("target_sheet", config.get("target_sheet")),
+            folder_name
+        )
 
 
 if __name__ == "__main__":
