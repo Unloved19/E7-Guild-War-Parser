@@ -1,8 +1,9 @@
-```markdown
 # ⚔️ Epic Seven Guild War Parser
 
 Automates tracking guild war performance using screenshots or live screen capture.  
 Supports **Google Sheets** and **Local Excel** modes.
+
+[Download Latest Release](../../releases) · [Report Bug](../../issues)
 
 ---
 
@@ -16,21 +17,31 @@ Supports **Google Sheets** and **Local Excel** modes.
 ### Step 1: Download
 Download and extract `GW_Parser_Windows.zip` from the [Releases](../../releases) page.
 
-### Step 2: OAuth Credentials (Google Sheets Mode Only)
+### Step 2: Google Cloud Setup (Google Sheets Mode Only)
 
 > [!TIP]
-> Excel-only users can skip this step.
+> Excel-only users can skip this step. You only need to do this once. It takes about 3 minutes.
 
-1. Download [`client_secret.json`](https://drive.google.com/file/d/14BRDjGtVm8RTsdlKj0CT-X0Mr4tQewwA/view?usp=sharing)
-2. Place it in the extracted folder, next to `GW Parser.exe`
+To connect to Google Sheets, you need a credentials file. This uses **your own** free Google Cloud quota (it costs $0).
 
-```text
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and log in.
+2. Click the **Select a project** dropdown (top left) → Click **New Project** → Name it `GW Parser` → Click **Create**.
+3. In the top search bar, search for **Google Sheets API** → Click it → Click **Enable**.
+4. Search again for **Google Drive API** → Click it → Click **Enable**.
+5. Go to **APIs & Services** → **Credentials** (left sidebar).
+6. Click **+ CREATE CREDENTIALS** (top) → Select **OAuth client ID**.
+7. If asked to configure the consent screen, select **External** → Click **Create** → Fill in an App name (e.g., "My GW Parser") → Click **Save and Continue** through the rest.
+8. Back on the Credentials page, set the Application type dropdown to **Desktop app** → Name it `GW Parser` → Click **Create**.
+9. A popup will appear. Click the **Download JSON** button.
+10. Rename the downloaded file to exactly **`client_secret.json`** and place it in your GW Parser folder next to `GW Parser.exe`.
+
+~~~text
 📁 GW_Parser_Windows/
 ├── 📄 GW Parser.exe
 ├── 📄 client_secret.json  ← Place here
 ├── 📄 GW Tracker.xlsx
 └── 📄 ... (other files)
-```
+~~~
 
 ### Step 3: Run
 Double-click **`GW Parser.exe`**
@@ -78,7 +89,7 @@ Double-click **`GW Parser.exe`**
 
 ## 📁 File Structure
 
-```text
+~~~text
 📁 Extracted Folder/
 ├── GW Parser.exe          # Main launcher
 ├── GW Tracker.xlsx        # Excel mode template
@@ -92,4 +103,4 @@ Double-click **`GW Parser.exe`**
 ├── War Screenshots/       # Screenshot storage (auto-generated)
 ├── War Records/           # Exported PNG summaries (auto-generated)
 └── client_secret.json     # User must add this (Google Sheets only)
-```
+~~~
