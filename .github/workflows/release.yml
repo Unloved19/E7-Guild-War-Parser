@@ -21,11 +21,11 @@ jobs:
       with:
         python-version: '3.11'
 
-    - name: Install PyInstaller
-      run: python -m pip install pyinstaller
+    - name: Install PyInstaller & Pillow
+      run: python -m pip install pyinstaller Pillow
 
     - name: Build Launcher EXE
-      run: pyinstaller --onefile --name "GW Parser" --icon=icon.ico --console launcher.py
+      run: pyinstaller --onefile --name "GW Parser" --icon=icon.png --console launcher.py
 
     - name: Package Release Files
       run: |
