@@ -78,6 +78,19 @@ except Exception as e:
     raise SystemExit(1)
 
 # ============================================================================
+# WINDOWS TASKBAR ICON FIX
+# ============================================================================
+import ctypes
+import sys
+if sys.platform == "win32":
+    try:
+        # Tells Windows this is a unique app, not a generic python script
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Unloved19.GWParser")
+    except Exception:
+        pass
+
+
+# ============================================================================
 # CONSTANTS & PATHS
 # ============================================================================
 
@@ -805,6 +818,9 @@ class GwParserApp(ctk.CTk):
         super().__init__()
         self.title("Guild War Parser")
         self.geometry("900x660")
+        icon_path = BASE_DIR / "app_icon.ico"
+        if icon_path.exists():
+            self.iconbitmap(str(icon_path))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Stdio redirectors
