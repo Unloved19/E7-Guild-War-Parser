@@ -38,9 +38,6 @@ jobs:
         # Copy all necessary Python scripts
         Copy-Item "*.py" "release/"
         
-        # Copy OAuth credentials (Required since you share your OAuth)
-        Copy-Item "client_secret.json" "release/"
-        
         # Zip the release folder
         Compress-Archive -Path "release/*" -DestinationPath "GW_Parser_Windows.zip"
 
