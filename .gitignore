@@ -24,6 +24,7 @@ __tmp_export_*.pdf
 e7_keys.log
 API Packets/
 Zodiac GW Spreadsheet.xlsx
+Zodiac GW.xlsx
 client_secret.json
 
 # NOTE: client_secret.json is INTENTIONALLY NOT ignored.
@@ -90,3 +91,5 @@ desktop.ini
 # DEVELOPMENT / DEBUG (Uncomment to ignore local test scripts)
 # ============================================================================
 zodiac_war_tools.py
+test_override.py
+test_key.py

@@ -9,6 +9,14 @@ import shutil
 import threading
 import tempfile
 import time
+import unicodedata
+from datetime import date, datetime
+
+try:
+    import mss
+    import numpy as np
+except ImportError as exc:
+    raise SystemExit("Missing dependency: mss or numpy. Install with: python -m pip install mss numpy") from exc
 
 try:
     import cv2
@@ -20,11 +28,17 @@ try:
 except ImportError as exc:
     raise SystemExit("Missing dependency: easyocr. Install with: python -m pip install easyocr") from exc
 
+try:
+    from openpyxl.utils.datetime import from_excel
+except ImportError:
+    from_excel = None
+
 # ============================================================================
 # PATHS & FILE LOCATIONS
 # ============================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
 SCREENSHOTS_ROOT = BASE_DIR / "War Screenshots"
 ALIASES_PATH = BASE_DIR / "war_name_aliases.json"
 DEBUG_ROOT = BASE_DIR / "debug_gw_parser"
@@ -80,7 +94,7 @@ DEF_CROP_X2 = 1462  # Exactly 210px wide
 NAME_TOKEN_RE = re.compile(r"[A-Za-z0-9一-龯ぁ-んァ-ン가-힣·._'\-]+")
 RE_WHITESPACE = re.compile(r"\s+")
 RE_REMOVED_TAG = re.compile(r"\s+\(Removed [^)]+\)$", re.IGNORECASE)
-RE_PARENTHETICAL = re.compile(r"\s+\([^)]*\)$")
+RE_PARENTHETICAL = re.compile(r"\s+\([^)]*\)")
 RE_RANK_ART1 = re.compile(r"(?i)\b[s$]?\.*rank[\.:,\-\s]*\d+\b")
 RE_RANK_ART2 = re.compile(r"(?i)\brank[\.:,\-\s]*\d+\b")
 RE_RANK_ART3 = re.compile(r"(?i)\bs\.?rank\b")
@@ -165,6 +179,228 @@ def load_aliases(path: Path) -> Dict[str, str]:
 def save_aliases(path: Path, aliases: Dict[str, str]) -> None:
     path.write_text(json.dumps(aliases, ensure_ascii=False, indent=2), encoding="utf-8")
 
+# ============================================================================
+# WORKSHEET READING UTILITIES (Shared by GS and Excel parsers)
+# ============================================================================
+
+def cell_val(data, row: int, col: int):
+    """Get cell value from fetched/2D list data. row and col are 1-indexed."""
+    if row < 1 or row > len(data):
+        return None
+    row_data = data[row - 1]
+    if col < 1 or col > len(row_data):
+        return None
+    val = row_data[col - 1]
+    return val if val != "" else None
+
+
+def col_letter_to_num(letter: str) -> int:
+    num = 0
+    for ch in letter.upper():
+        num = num * 26 + (ord(ch) - ord("A") + 1)
+    return num
+
+
+def read_column_a_overrides(
+    data, roster: List[str], override_col: str
+) -> Dict[str, str]:
+    """Reads the override column to build match redirects for returning players."""
+    overrides: Dict[str, str] = {}
+    row = 5
+    roster_idx = 0
+    override_col_num = col_letter_to_num(override_col)
+
+    while row <= len(data) + 10 and roster_idx < len(roster):
+        name = cell_val(data, row, 2)
+        override_val = cell_val(data, row, override_col_num)
+
+        if name and str(name).strip() in roster:
+            override = str(override_val).strip() if override_val else ""
+            if override:
+                name_str = str(name).strip()
+                override_key = canonical_key(override)
+                overrides[override_key] = name_str
+            roster_idx += 1
+
+        row += 1
+
+    if overrides:
+        print(f"  [Overrides] Loaded {len(overrides)} override(s):")
+        for ovr_key, target_name in overrides.items():
+            base_key = canonical_key(base_roster_name(target_name))
+            if ovr_key != base_key:
+                print(f"    NOTE: Key '{ovr_key}' != target base '{base_key}' (char mismatch - collision resolver handles this)")
+            print(f"    '{ovr_key}' -> '{target_name}'")
+    else:
+        print(f"  [Overrides] No overrides found in column {override_col}")
+
+    return overrides
+
+# ============================================================================
+# SHARED CONFIG & CLI (Used by both GS and Excel parsers)
+# ============================================================================
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing {CONFIG_PATH.name}. Run first_run_setup.py first."
+        )
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def ask_folder_name() -> str:
+    folder_name = input("Enter War Screenshots folder name (e.g. 20260410): ").strip()
+    if not RE_FOLDER_NAME.fullmatch(folder_name):
+        raise ValueError("Folder name must be 8 digits in YYYYMMDD format.")
+    return folder_name
+
+
+def ask_run_mode() -> str:
+    print("\nRun Mode")
+    print("1. Dry run")
+    print("2. Write to workbook")
+    print("3. Cancel")
+    while True:
+        choice = input("Choose 1/2/3: ").strip()
+        if choice == "1":
+            return "dry"
+        if choice == "2":
+            return "write"
+        if choice == "3":
+            raise KeyboardInterrupt
+        print("Invalid choice.")
+
+
+# ============================================================================
+# SHARED WORKSHEET READING LOGIC (Operates on 2D lists)
+# ============================================================================
+
+def read_roster(data) -> List[str]:
+    roster: List[str] = []
+    blank_run = 0
+    row = 5
+    while row <= len(data) + 10:
+        value = cell_val(data, row, 2)
+        if value is None:
+            blank_run += 1
+            if blank_run >= 10:
+                break
+        else:
+            blank_run = 0
+            name = str(value).strip()
+            low = name.lower()
+            if low.startswith("notes:") or low.startswith("note:"):
+                row += 1
+                continue
+            roster.append(name)
+        row += 1
+
+    if not roster:
+        raise RuntimeError("No roster found starting from B5.")
+    return roster
+
+def sheet_date_to_folder_date_str(value) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date().strftime("%Y%m%d")
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    # Handle raw Excel integer dates if openpyxl is available
+    if isinstance(value, (int, float)) and from_excel is not None:
+        try:
+            dt = from_excel(value)
+            if isinstance(dt, datetime):
+                return dt.date().strftime("%Y%m%d")
+            if isinstance(dt, date):
+                return dt.strftime("%Y%m%d")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        value = value.strip()
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y", "%Y/%m/%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(value, fmt).strftime("%Y%m%d")
+            except ValueError:
+                continue
+    return None
+
+def find_date_row(data, folder_name: str, date_col: int = 15) -> int:
+    for row in range(5, len(data) + 1):
+        val = cell_val(data, row, date_col)
+        if sheet_date_to_folder_date_str(val) == folder_name:
+            return row
+    raise RuntimeError(f"Could not find date {folder_name} in column {date_col}.")
+
+
+def find_section_starts(data) -> Dict[str, int]:
+    starts: Dict[str, int] = {}
+    max_col = max((len(r) for r in data), default=0)
+    for col in range(1, max_col + 1):
+        value = cell_val(data, 2, col)
+        if not value:
+            continue
+        text = str(value).strip()
+        if text in SECTION_HEADERS and text not in starts:
+            starts[text] = col
+    missing = [h for h in WRITE_SECTIONS if h not in starts]
+    if missing:
+        raise RuntimeError(f"Missing section headers: {missing}")
+    return starts
+
+
+def build_target_section_maps(data) -> Dict[str, Dict[str, int]]:
+    starts = find_section_starts(data)
+    maps: Dict[str, Dict[str, int]] = {}
+    sorted_headers = sorted(starts.items(), key=lambda item: item[1])
+    max_col = max((len(r) for r in data), default=0)
+
+    for idx, (header, start_col) in enumerate(sorted_headers):
+        next_start = sorted_headers[idx + 1][1] if idx + 1 < len(sorted_headers) else max_col + 1
+        name_map: Dict[str, int] = {}
+        for col in range(start_col + 1, next_start):
+            value = cell_val(data, 2, col)
+            if not value:
+                continue
+            name = str(value).strip()
+            if name in SECTION_HEADERS:
+                break
+            if name != "":
+                name_map[name] = col
+        maps[header] = name_map
+    return maps
+
+
+def row_has_existing_values(
+    data, target_row: int, section_maps: Dict[str, Dict[str, int]]
+) -> bool:
+    for section_name in WRITE_SECTIONS:
+        for col in section_maps[section_name].values():
+            if cell_val(data, target_row, col) not in (None, ""):
+                return True
+    return False
+
+
+def get_previous_war_active_status(
+    data, target_row: int, section_maps: Dict[str, Dict[str, int]], date_col: int = 15
+) -> Optional[Dict[str, bool]]:
+    active_cols = section_maps.get("Roster Active Status", {})
+    for row in range(target_row - 1, 4, -1):
+        if not cell_val(data, row, date_col):
+            continue
+        prev_status = {}
+        has_any_data = False
+        for name, col in active_cols.items():
+            val = cell_val(data, row, col)
+            if val is not None and val != "":
+                has_any_data = True
+                prev_status[name] = True
+            else:
+                prev_status[name] = False
+        if has_any_data:
+            return prev_status
+    return None
+
 
 # ============================================================================
 # TEXT PROCESSING & NORMALIZATION
@@ -191,6 +427,9 @@ def strip_rank_artifacts(text: str) -> str:
 
 def canonical_key(name: str) -> str:
     base = base_roster_name(name)
+    # CRITICAL: Normalize Unicode so composed/decomposed forms match
+    # e.g. "ū" (U+016B) vs "u" + combining macron (U+0075 U+0304)
+    base = unicodedata.normalize("NFKC", base)
     return "".join(ch.lower() for ch in base if ch.isalnum())
 
 
@@ -296,23 +535,18 @@ def crop_bounds(
     stat_center_y: int,
     row_slot: Optional[int] = None,
     total_slots: Optional[int] = None,
+    y_shift: int = 0,
 ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
     height, _ = img.shape[:2]
 
-    # Reverted top padding to original, extended bottom by 30px to catch UI scroll overshoot
+    # Name crop bounds (Name doesn't need shifting, only stats do)
     name_y1 = max(0, name_center_y - 26)
-    name_y2 = min(height, name_center_y + 93)  # Extended bottom by 30px (was 63)
+    name_y2 = min(height, name_center_y + 93)
 
-    # Reverted top padding to original, extended bottom by 30px to catch UI scroll overshoot
-    stats_y1 = max(0, stat_center_y - 33)
-    stats_y2 = min(height, stat_center_y + 185)  # Extended bottom by 30px (was 155)
-
-    if total_slots == 4 and row_slot == 4:
-        stats_y2 = min(height, stat_center_y + 198)  # Extended bottom by 30px (was 168)
-
-    if total_slots == 2:
-        stats_y2 = min(height, stats_y2 + 10)
-
+    # Stat crop bounds (ADD y_shift to move boxes DOWN when UI is scrolled extra)
+    stats_y1 = max(0, stat_center_y - 33 + y_shift)
+    stats_y2 = min(height, stat_center_y + 185 + y_shift)
+    
     return (name_y1, name_y2), (stats_y1, stats_y2), (stats_y1, stats_y2)
 
 def safe_crop(img, x1: int, y1: int, x2: int, y2: int):
@@ -427,7 +661,9 @@ def extract_name_text(reader, image) -> str:
     return max(candidates, key=name_token_score)
 
 
-def parse_name_candidates_from_crop(image, roster: List[str], matcher: Dict[str, str], aliases_working: Dict[str, str]) -> List[str]:
+def parse_name_candidates_from_crop(
+    image, roster: List[str], matcher: Dict[str, str], aliases_working: Dict[str, str]
+) -> List[str]:
     candidates: List[str] = []
     for reader_type in ("name_primary", "name_ja", "name_ko"):
         reader = get_reader(reader_type)
@@ -436,13 +672,9 @@ def parse_name_candidates_from_crop(image, roster: List[str], matcher: Dict[str,
         if not text or text in candidates:
             continue
         candidates.append(text)
-        
-        # EARLY EXIT: If we found a direct match, skip Japanese/Korean OCR entirely
         if try_direct_name_match(text, roster, matcher, aliases_working) is not None:
             break
-            
     return candidates
-
 
 def try_direct_name_match(
     raw_name: str, roster: List[str], matcher: Dict[str, str], aliases: Dict[str, str]
@@ -450,7 +682,6 @@ def try_direct_name_match(
     raw_name = cleaned_text(raw_name)
     key = canonical_key(raw_name)
 
-    # Matcher first (includes column C overrides)
     if key in matcher:
         matched = matcher[key]
         note = "Matched to removed-tag name" if base_roster_name(matched) != matched else ""
@@ -458,14 +689,12 @@ def try_direct_name_match(
             note = "Column C override (superseded alias)"
         return matched, note
 
-    # Alias fallback (only if matcher has no entry for this key)
     if raw_name in aliases and aliases[raw_name] in roster:
         matched = aliases[raw_name]
         note = "Matched to removed-tag name" if base_roster_name(matched) != matched else "Manual alias fix"
         return matched, note
 
     return None
-
 
 # ============================================================================
 # STATS PARSING (OFFENSE & DEFENSE)
@@ -620,18 +849,90 @@ def parse_defense_from_crop(reader, image) -> Tuple[int, int, int]:
 # ============================================================================
 
 def build_roster_matcher(
-    roster: List[str], overrides: Optional[Dict[str, str]] = None
+    roster: List[str], 
+    overrides: Optional[Dict[str, str]] = None,
+    aliases_working: Optional[Dict[str, str]] = None,
+    aliases_created_this_run: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     matcher: Dict[str, str] = {}
+    
+    # Step 1: Group roster by base key to find duplicate names (e.g. Removed + Rejoined)
+    base_groups: Dict[str, List[str]] = {}
     for name in roster:
-        matcher[canonical_key(name)] = name
-        matcher[canonical_key(base_roster_name(name))] = name
-
-    # Overrides applied last so they take priority over normal entries
+        base_key = canonical_key(base_roster_name(name))
+        base_groups.setdefault(base_key, []).append(name)
+    
+    collisions = {k: v for k, v in base_groups.items() if len(v) > 1}
+    
+    # Step 2: Resolve collisions using overrides
+    if collisions:
+        print(f"  [Matcher] Detected {len(collisions)} base name collision(s):")
+        for base_key, names in collisions.items():
+            print(f"    '{base_key}':")
+            for n in names:
+                tag = " [REMOVED]" if "(removed" in n.lower() else " [ACTIVE]"
+                print(f"      - {n}{tag}")
+            
+            winner = None
+            
+            if overrides:
+                # Strategy A: Exact override target match (non-removed only)
+                for ovr_key, ovr_target in overrides.items():
+                    if ovr_target in names and "(removed" not in ovr_target.lower():
+                        winner = ovr_target
+                        matcher[ovr_key] = ovr_target
+                        break
+                
+                # Strategy B: Fuzzy override key match (handles char typos like 焔 vs 焰)
+                if not winner:
+                    for ovr_key, ovr_target in overrides.items():
+                        if "(removed" in ovr_target.lower():
+                            continue
+                        score = SequenceMatcher(None, base_key, ovr_key).ratio()
+                        if score >= 0.86:
+                            winner = ovr_target
+                            matcher[ovr_key] = ovr_target
+                            print(f"      Fuzzy override key match (score: {score:.2f})")
+                            break
+            
+            # Strategy C: Default to non-removed player
+            if not winner:
+                non_removed = [n for n in names if "(removed" not in n.lower()]
+                winner = non_removed[0] if non_removed else names[0]
+            
+            matcher[base_key] = winner
+            print(f"      Resolved -> {winner}")
+            
+            # Auto-alias so future runs skip this logic entirely
+            if aliases_working is not None and aliases_created_this_run is not None:
+                base_name = base_roster_name(names[0])
+                if aliases_working.get(base_name) != winner:
+                    aliases_working[base_name] = winner
+                    aliases_created_this_run[base_name] = winner
+                    print(f"      Auto-aliased '{base_name}' -> '{winner}'")
+    
+    # Step 3: Fill in all non-colliding names normally
+    for name in roster:
+        full_key = canonical_key(name)
+        base_key = canonical_key(base_roster_name(name))
+        
+        if base_key in collisions:
+            # Map the full tagged key (e.g. "kyūbi焰removed2426") to the collision winner
+            if full_key != base_key and full_key not in matcher:
+                matcher[full_key] = matcher[base_key]
+            continue
+            
+        if full_key not in matcher:
+            matcher[full_key] = name
+        if base_key not in matcher:
+            matcher[base_key] = name
+    
+    # Step 4: Apply overrides for any non-collision cases
     if overrides:
         for key, name in overrides.items():
-            matcher[key] = name
-
+            if key not in matcher:
+                matcher[key] = name
+    
     return matcher
 
 
@@ -686,7 +987,6 @@ def resolve_name_candidates(
         aliases_created_this_run[primary_raw] = matched
     note = "Matched to removed-tag name" if base_roster_name(matched) != matched else "Manual alias fix"
     return primary_raw, matched, note
-
 
 def prompt_manual_name(raw_name: str, roster: List[str], suggestions: List[str], ctx: OCRContext) -> str:
     print(f"\nUnmatched OCR name on screenshot {ctx.screenshot}, row {ctx.order}")
@@ -768,7 +1068,7 @@ def extract_rows_from_folder(
     aliases_existing: Dict[str, str],
     aliases_working: Dict[str, str],
     aliases_created_this_run: Dict[str, str],
-    overrides: Dict[str, str], 
+    overrides: Dict[str, str],
 ) -> Tuple[List[OCRRow], Dict[Tuple[str, int], OCRContext]]:
     if not folder.exists():
         raise FileNotFoundError(f"Folder not found: {folder}")
@@ -778,10 +1078,9 @@ def extract_rows_from_folder(
     if not pngs:
         raise RuntimeError(f"No PNG files found in {folder}")
 
-    matcher = build_roster_matcher(roster, overrides)  # <--- PASS OVERRIDES TO MATCHER BUILDER
+    matcher = build_roster_matcher(roster, overrides, aliases_working, aliases_created_this_run)
     stats_reader = get_reader("stats")
     
-    # Pre-load all OCR models into memory to avoid mid-run stuttering
     print("Loading OCR models...", end=" ", flush=True)
     get_reader("name_primary")
     get_reader("name_ja")
@@ -792,7 +1091,7 @@ def extract_rows_from_folder(
     contexts: Dict[Tuple[str, int], OCRContext] = {}
     order = 1
 
-    for png in pngs:
+    for idx, png in enumerate(pngs):
         img = cv2.imread(str(png))
         if img is None:
             print(f"Warning: could not read image {png.name}, skipping.")
@@ -800,17 +1099,16 @@ def extract_rows_from_folder(
 
         centers = detect_rank_centers(img)
         screenshot_start_count = len(extracted)
+        is_last_image = (idx == len(pngs) - 1)
+        shift = 45 if is_last_image else 0
 
         for row_slot, (name_center, stat_center) in enumerate(centers, start=1):
-            (name_y1, name_y2), (stats_y1, stats_y2), _ = crop_bounds(img, name_center, stat_center, row_slot, len(centers))
-
-            # Perspective correction: Rows 3 and 4 curve inward on mobile screens.
+            (name_y1, name_y2), (stats_y1, stats_y2), _ = crop_bounds(img, name_center, stat_center, row_slot, len(centers), y_shift=shift)
             narrow_offset = 15 if row_slot in (3, 4) else 0
 
             name_crop = safe_crop(img, NAME_CROP_X1, name_y1, NAME_CROP_X2, name_y2)
             off_crop = safe_crop(img, OFF_CROP_X1, stats_y1, OFF_CROP_X2 - narrow_offset, stats_y2)
             def_crop = safe_crop(img, DEF_CROP_X1, stats_y1, DEF_CROP_X2 - narrow_offset, stats_y2)
-            
 
             name_candidates = parse_name_candidates_from_crop(name_crop, roster, matcher, aliases_working)
             if not name_candidates:
@@ -820,12 +1118,8 @@ def extract_rows_from_folder(
             def_w, def_d, def_l = parse_defense_from_crop(stats_reader, def_crop)
 
             ctx = OCRContext(
-                folder_name=folder_name,
-                screenshot=png.name,
-                order=order,
-                center_y=name_center,
-                row_slot=row_slot,
-                total_slots=len(centers),
+                folder_name=folder_name, screenshot=png.name, order=order,
+                center_y=name_center, row_slot=row_slot, total_slots=len(centers),
                 name_candidates=name_candidates,
                 off_w=off_w, off_d=off_d, off_l=off_l,
                 def_w=def_w, def_d=def_d, def_l=def_l,
@@ -834,9 +1128,8 @@ def extract_rows_from_folder(
             raw_name, matched_name, note = resolve_name_candidates(
                 name_candidates, roster, matcher,
                 aliases_existing, aliases_working, aliases_created_this_run, ctx,
-                roster_normalized_cache,  # Fixed: no trailing equals sign
+                roster_normalized_cache,
             )
-            # Skip row if user typed '0' to ignore garbage OCR (like "S.Rank")
             if matched_name == "__SKIP__":
                 continue
             row = OCRRow(
@@ -1017,6 +1310,123 @@ def print_run_summary(
     print(f"Unique matched players: {len(extracted)}")
     print(f"Inactive roster members: {count_inactive(normalized)}")
     print(f"New aliases this run: {len(aliases_created_this_run)}")
+    
+# ============================================================================
+# SHARED UI & WORKFLOW LOGIC
+# ============================================================================
+
+def prompt_and_get_screenshots() -> Tuple[Path, str, Optional[Path]]:
+    """Handles the UI for choosing data source and live capture. Returns (folder, folder_name, temp_dir)."""
+    print("\nData Source:")
+    print("1. Screenshot Folder")
+    print("2. Live Screen Capture (Switch to game and scroll)")
+    while True:
+        source_choice = input("Choose 1/2: ").strip()
+        if source_choice in ("1", "2"):
+            break
+        print("Invalid choice. Please enter 1 or 2.")
+
+    video_temp_dir = None
+    folder_name = ask_folder_name()
+
+    if source_choice == "2":
+        print("\nSwitch to the game and open the Guild War logs.")
+        for i in range(10, 0, -1):
+            print(f"Recording starts in {i} seconds...", end="\r", flush=True)
+            time.sleep(1)
+        print("Recording started!                    ")
+
+        video_temp_dir = Path(tempfile.mkdtemp(prefix="gw_live_capture_"))
+        stop_event = threading.Event()
+        capture_thread = threading.Thread(target=live_capture_loop, args=(video_temp_dir, stop_event))
+        
+        capture_thread.start()
+        input("\n(Recording in background... Press ENTER here when you are done scrolling)\n")
+        stop_event.set()
+        capture_thread.join()
+        
+        return video_temp_dir, folder_name, video_temp_dir
+    else:
+        return SCREENSHOTS_ROOT / folder_name, folder_name, None
+
+
+def resolve_active_inactive_status(
+    normalized: List[Dict[str, object]],
+    extracted: List[OCRRow],
+    prev_active_status: Optional[Dict[str, bool]],
+) -> None:
+    """Handles the logic for new recruits and missing players. Modifies lists in-place."""
+    for row in normalized:
+        display_name = base_roster_name(row["Name"])
+
+        # SCENARIO 1: The "New Recruit Paradox"
+        if row["Active flag"] == 1 and prev_active_status is not None and not prev_active_status.get(row["Name"], False):
+            if row["Tokens Used"] == 0:
+                if ask_yes_no(
+                    f"{display_name} is a new recruit with 0 tokens used. Did they actually participate in this war?",
+                    default=False,
+                ):
+                    row["Notes"] = "Active (New recruit, confirmed 0 stats)"
+                else:
+                    print(f"  -> Marking {display_name} as inactive.")
+                    row.update({
+                        "Active flag": "", "Tokens Used": "", "Offense W": "", "Offense D": "",
+                        "Offense L": "", "Defense W": "", "Defense D": "", "Defense L": "",
+                        "Notes": "Inactive (New recruit, did not participate in this war)",
+                    })
+                    extracted[:] = [r for r in extracted if r.matched_name != row["Name"]]
+            else:
+                row["Notes"] = "Active (New recruit)"
+            continue
+
+        # SCENARIO 2: Missing from screenshots entirely
+        if row["Notes"] == "Inactive (not found in screenshots)":
+            should_prompt = prev_active_status is None or prev_active_status.get(row["Name"], False)
+            if should_prompt:
+                action = prompt_missing_active_player(display_name)
+                if action == "manual":
+                    print(f"\nEntering stats for {display_name}:")
+                    off_w, off_d, off_l = prompt_stat_line("Offense")
+                    def_w, def_d, def_l = prompt_stat_line("Defense")
+                    row.update({
+                        "Active flag": 1, "Tokens Used": off_w + off_d + off_l,
+                        "Offense W": off_w, "Offense D": off_d, "Offense L": off_l,
+                        "Defense W": def_w, "Defense D": def_d, "Defense L": def_l,
+                        "Notes": "Active (Manually entered stats)",
+                    })
+                    extracted.append(OCRRow(
+                        screenshot="MANUAL", order=len(extracted) + 1,
+                        raw_name=display_name, matched_name=row["Name"],
+                        off_w=off_w, off_d=off_d, off_l=off_l,
+                        def_w=def_w, def_d=def_d, def_l=def_l,
+                        note="Manually entered (missing from screenshots)",
+                    ))
+            continue
+
+
+def handle_post_processing(
+    run_mode: str, extracted: List[OCRRow], normalized: List[Dict[str, object]], 
+    aliases_created_this_run: Dict[str, str],
+) -> str:
+    """Handles terminal output, threshold checks, and dry-run conversion. Returns final run_mode."""
+    print_results_output_terminal(extracted)
+    print_normalized_table_terminal(normalized)
+    print_run_summary(extracted, normalized, aliases_created_this_run)
+
+    if len(extracted) < MIN_EXPECTED_MATCHED_PLAYERS:
+        print(f"\nWarning: matched unique players {len(extracted)} is below threshold {MIN_EXPECTED_MATCHED_PLAYERS}.")
+        if not ask_yes_no("Continue anyway?", default=False):
+            raise RuntimeError("Run cancelled because extracted player count was below threshold.")
+
+    if run_mode == "dry":
+        print("\nDry run complete. No workbook or alias changes were saved.")
+        if ask_yes_no("Do you want to write these results to the workbook now?", default=False):
+            print("\nConverting dry run to write mode...")
+            return "write"
+        return "dry"
+    
+    return run_mode
+    
 
 def live_capture_loop(temp_dir: Path, stop_event: threading.Event) -> int:
     """
@@ -1081,5 +1491,3 @@ def live_capture_loop(temp_dir: Path, stop_event: threading.Event) -> int:
     sct.close()
     print(f"\n[*] Capture stopped. Saved {saved_count} frames.")
     return saved_count
-
-

@@ -20,7 +20,6 @@ from pathlib import Path
 import mss
 import numpy as np
 import cv2
-import easyocr
 
 # ============================================================================
 # TCL/TK AUTO-FIX - Must run before importing tkinter
